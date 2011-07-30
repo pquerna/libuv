@@ -348,6 +348,13 @@ int uv_tcp_init(uv_tcp_t* tcp) {
   ev_init(&tcp->write_watcher, uv__stream_io);
   tcp->write_watcher.data = tcp;
 
+#ifdef USE_THREADED_ACCEPT
+  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = tcp->accept_workers[i];
+    worker->baton = NULL;
+  }
+#endif
+
   assert(ngx_queue_empty(&tcp->write_queue));
   assert(ngx_queue_empty(&tcp->write_completed_queue));
   assert(tcp->write_queue_size == 0);
@@ -766,7 +773,9 @@ void uv__finish_close(uv_handle_t* handle) {
 
         for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
           uv__accept_worker_t *worker = tcp->accept_workers[i];
-          pthread_join(worker->t);
+          if (worker->baton != NULL) {
+            pthread_join(worker->t);
+          }
         }
       }
 #endif
