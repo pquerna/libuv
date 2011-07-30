@@ -42,6 +42,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <limits.h> /* PATH_MAX */
+#include <sys/poll.h>
 
 #ifdef __sun
 # include <sys/types.h>
@@ -621,10 +622,14 @@ int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
 #ifdef USE_THREADED_ACCEPT
 
 static void* accept_thread(void *baton) {
+  int sockfd;
+  struct pollfd pollfd;
   uv__accept_worker_t *worker = baton;
   uv_tcp_t* tcp = worker->baton;
-  int sockfd;
   fdq_t *q = NULL;
+
+  pollfd.fd = tcp->fd;
+  pollfd.events = POLLIN | POLLHUP | POLLERR;
 
   while (tcp->fd >= 0) {
     struct sockaddr_storage addr;
@@ -632,6 +637,12 @@ static void* accept_thread(void *baton) {
     if (q == NULL) {
       q = malloc(sizeof(fdq_t));
       ngx_queue_init(&q->queue);
+    }
+
+    poll(&pollfd, 1, 0);
+
+    if (tcp->fd < 0) {
+      break;
     }
 
     sockfd = uv__accept(tcp->fd, (struct sockaddr*)&addr, sizeof addr);
@@ -706,8 +717,6 @@ static int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
     uv_async_init(&tcp->accept_handle, accept_queue_cb);
     tcp->accept_handle.data = tcp;
 
-    uv__nonblock(tcp->fd, 0);
-
     for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
       uv__accept_worker_t *worker = &tcp->accept_workers[i];
       worker->baton = tcp;
@@ -778,7 +787,8 @@ void uv__finish_close(uv_handle_t* handle) {
         for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
           uv__accept_worker_t *worker = &tcp->accept_workers[i];
           if (worker->baton != NULL) {
-            pthread_join(worker->t, NULL);
+            /* TODO: finish cleanup */
+            /* pthread_join(worker->t, NULL); */
           }
         }
       }
