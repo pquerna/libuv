@@ -32,6 +32,11 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
+/* #define USE_THREADED_ACCEPT */
+
+#ifdef USE_THREADED_ACCEPT
+#include <pthread.h>
+#endif
 
 /* Note: May be cast to struct iovec. See writev(2). */
 typedef struct {
@@ -79,9 +84,15 @@ typedef struct {
   int accepted_fd;
 
 
+#ifdef USE_THREADED_ACCEPT
 /* UV_TCP */
+#define UV_TCP_PRIVATE_FIELDS \
+  pthread_mutex_t accepted_fds_mutex; \
+  ngx_queue_t accepted_fds; \
+  uv_async_t accept_handle;
+#else
 #define UV_TCP_PRIVATE_FIELDS
-
+#endif
 
 /* UV_NAMED_PIPE */
 #define UV_PIPE_PRIVATE_TYPEDEF

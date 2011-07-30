@@ -312,6 +312,20 @@ int uv_write(uv_write_t* req, uv_stream_t* handle, uv_buf_t bufs[], int bufcnt,
 
 
 /*
+ * Subclass of uv_handle_t. libev wrapper. uv_async_send wakes up the event
+ * loop and calls the async handle's callback There is no guarantee that
+ * every uv_async_send call leads to exactly one invocation of the callback;
+ * The only guarantee is that the callback function is  called at least once
+ * after the call to async_send. Unlike all other libuv functions,
+ * uv_async_send can be called from another thread.
+ */
+struct uv_async_s {
+  UV_HANDLE_FIELDS
+  UV_ASYNC_PRIVATE_FIELDS
+};
+
+
+/*
  * A subclass of uv_stream_t representing a TCP stream or TCP server. In the
  * future this will probably be split into two classes - one a stream and
  * the other a server.
@@ -416,19 +430,6 @@ int uv_idle_start(uv_idle_t* idle, uv_idle_cb cb);
 
 int uv_idle_stop(uv_idle_t* idle);
 
-
-/*
- * Subclass of uv_handle_t. libev wrapper. uv_async_send wakes up the event
- * loop and calls the async handle's callback There is no guarantee that
- * every uv_async_send call leads to exactly one invocation of the callback;
- * The only guarantee is that the callback function is  called at least once
- * after the call to async_send. Unlike all other libuv functions,
- * uv_async_send can be called from another thread.
- */
-struct uv_async_s {
-  UV_HANDLE_FIELDS
-  UV_ASYNC_PRIVATE_FIELDS
-};
 
 int uv_async_init(uv_async_t* async, uv_async_cb async_cb);
 

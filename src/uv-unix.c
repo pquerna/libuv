@@ -50,6 +50,7 @@
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h> /* _NSGetExecutablePath */
+#include <sys/uio.h> /* writev */
 #endif
 
 #if defined(__FreeBSD__)
@@ -64,6 +65,11 @@
 extern char **environ;
 # endif
 
+
+#ifdef USE_THREADED_ACCEPT
+/* TODO: tune by hw.ncpu */
+#define THREADED_ACCEPT_COUNT (8)
+#endif
 
 static uv_err_t last_err;
 
@@ -120,6 +126,7 @@ static void uv__read(uv_stream_t* stream);
 static void uv__stream_connect(uv_stream_t*);
 static void uv__stream_io(EV_P_ ev_io* watcher, int revents);
 static void uv__pipe_accept(EV_P_ ev_io* watcher, int revents);
+
 
 #ifndef __GNUC__
 #define __attribute__(a)
@@ -346,6 +353,11 @@ int uv_tcp_init(uv_tcp_t* tcp) {
   ev_init(&tcp->write_watcher, uv__stream_io);
   tcp->write_watcher.data = tcp;
 
+#ifdef USE_THREADED_ACCEPT
+  ngx_queue_init(&tcp->accepted_fds);
+  pthread_mutex_init(&tcp->accepted_fds_mutex, NULL);
+#endif
+
   assert(ngx_queue_empty(&tcp->write_queue));
   assert(ngx_queue_empty(&tcp->write_completed_queue));
   assert(tcp->write_queue_size == 0);
@@ -487,8 +499,7 @@ void uv__server_io(EV_P_ ev_io* watcher, int revents) {
   }
 }
 
-
-int uv_accept(uv_stream_t* server, uv_stream_t* client) {
+static int standard_accept(uv_stream_t* server, uv_stream_t* client) {
   uv_stream_t* streamServer;
   uv_stream_t* streamClient;
   int saved_errno;
@@ -522,6 +533,74 @@ out:
 }
 
 
+#ifdef USE_THREADED_ACCEPT
+typedef struct {
+  ngx_queue_t queue;
+  int fd;
+} fdq_t;
+
+static int tcp_accept(uv_tcp_t* server, uv_tcp_t* client) {
+  ngx_queue_t *q;
+  fdq_t *fd = NULL;
+  int saved_errno;
+  int status;
+  uv_stream_t* streamClient;
+
+  saved_errno = errno;
+  status = -1;
+
+  streamClient = (uv_stream_t*)client;
+
+  pthread_mutex_lock(&server->accepted_fds_mutex);
+
+  if (ngx_queue_empty(&server->accepted_fds)) {
+    pthread_mutex_unlock(&server->accepted_fds_mutex);
+    uv_err_new((uv_handle_t*)server, EAGAIN);
+    goto out;
+  }
+
+  q = ngx_queue_head(&server->accepted_fds);
+  if (!q) {
+    pthread_mutex_unlock(&server->accepted_fds_mutex);
+    uv_err_new((uv_handle_t*)server, EAGAIN);
+    goto out;
+  }
+
+  ngx_queue_remove(q);
+
+  pthread_mutex_unlock(&server->accepted_fds_mutex);
+
+  fd = ngx_queue_data(q, fdq_t, queue);
+
+  if (uv__stream_open(streamClient, fd->fd)) {
+    uv__close(fd->fd);
+    goto out;
+  }
+
+out:
+  if (fd) {
+    /* TODO: pool/reuse */
+    free(fd);
+  }
+
+  errno = saved_errno;
+  return status;
+}
+#endif
+
+int uv_accept(uv_stream_t* server, uv_stream_t* client) {
+#ifdef USE_THREADED_ACCEPT
+  switch (server->type) {
+    case UV_TCP:
+      return tcp_accept((uv_tcp_t*)server, (uv_tcp_t*)client);
+    default:
+      return standard_accept(server, client);
+  }
+#else
+  return standard_accept(server, client);
+#endif
+}
+
 int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
   switch (stream->type) {
     case UV_TCP:
@@ -534,6 +613,51 @@ int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
   }
 }
 
+#ifdef USE_THREADED_ACCEPT
+
+static void* accept_thread(void *baton) {
+  uv_tcp_t* tcp = baton;
+  int sockfd;
+  fdq_t *q = NULL;
+
+  while (tcp->fd >= 0) {
+    struct sockaddr_storage addr;
+
+    if (q == NULL) {
+      q = malloc(sizeof(fdq_t));
+      ngx_queue_init(&q->queue);
+    }
+
+    sockfd = uv__accept(tcp->fd, (struct sockaddr*)&addr, sizeof addr);
+    if (sockfd != -1) {
+      /* TODO: push to user */
+      q->fd = sockfd;
+      pthread_mutex_lock(&tcp->accepted_fds_mutex);
+      ngx_queue_insert_tail(&tcp->accepted_fds, &q->queue);
+      pthread_mutex_unlock(&tcp->accepted_fds_mutex);
+      q = NULL;
+
+      uv_async_send(&tcp->accept_handle);
+    }
+  }
+
+  if (q != NULL) {
+    free(q);
+  }
+
+  return NULL;
+}
+
+static void accept_queue_cb(uv_async_t* handle, int status) {
+  uv_tcp_t* tcp = handle->data;
+
+  /* TODO: better queue impl (accepted connection ring per-accept thread?) */
+  while(!ngx_queue_empty(&server->accepted_fds)) {
+    tcp->connection_cb((uv_stream_t*)tcp, 0);
+  }
+}
+
+#endif
 
 static int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
   int r;
@@ -566,11 +690,27 @@ static int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 
   tcp->connection_cb = cb;
 
+#ifdef USE_THREADED_ACCEPT
+  {
+    int i;
+
+    uv_async_init(&tcp->accept_handle, accept_queue_cb);
+    tcp->accept_handle.data = tcp;
+
+    uv__nonblock(tcp->fd, 0);
+
+    for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
+      /* TODO: cleanup */
+      pthread_t t;
+      pthread_create(&t, NULL, accept_thread, tcp);
+    }
+  }
+#else
   /* Start listening for connections. */
   ev_io_set(&tcp->read_watcher, tcp->fd, EV_READ);
   ev_set_cb(&tcp->read_watcher, uv__server_io);
   ev_io_start(EV_DEFAULT_ &tcp->read_watcher);
-
+#endif
   return 0;
 }
 
