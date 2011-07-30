@@ -650,6 +650,7 @@ static void* accept_thread(void *baton) {
       /* TODO: push to user */
       q->fd = sockfd;
       pthread_mutex_lock(&worker->fds_mutex);
+      worker->count++;
       ngx_queue_insert_tail(&worker->fds, &q->queue);
       pthread_mutex_unlock(&worker->fds_mutex);
       q = NULL;
@@ -667,13 +668,20 @@ static void* accept_thread(void *baton) {
 
 static void accept_queue_cb(uv_async_t* handle, int status) {
   int i;
+  int c = 0;
   uv_tcp_t* tcp = handle->data;
 
   for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
     uv__accept_worker_t *worker = &tcp->accept_workers[i];
-    if (!ngx_queue_empty(&worker->fds)) {
-      tcp->connection_cb((uv_stream_t*)tcp, 0);
-    }
+    /* TODO: cas */
+    pthread_mutex_lock(&worker->fds_mutex);
+    c += worker->count;
+    worker->count = 0;
+    pthread_mutex_unlock(&worker->fds_mutex);
+  }
+
+  for (i = 0; i < c; i++) {
+    tcp->connection_cb((uv_stream_t*)tcp, 0);
   }
 }
 

@@ -90,6 +90,7 @@ typedef struct {
 #define UV__THREADED_ACCEPT_COUNT (8)
 typedef struct {
   pthread_t t; \
+  int count; \
   pthread_mutex_t fds_mutex; \
   ngx_queue_t fds; \
   void *baton; \
