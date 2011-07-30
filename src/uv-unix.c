@@ -577,6 +577,8 @@ static int tcp_accept(uv_tcp_t* server, uv_tcp_t* client) {
     goto out;
   }
 
+  status = 0;
+
 out:
   if (fd) {
     /* TODO: pool/reuse */
@@ -652,7 +654,7 @@ static void accept_queue_cb(uv_async_t* handle, int status) {
   uv_tcp_t* tcp = handle->data;
 
   /* TODO: better queue impl (accepted connection ring per-accept thread?) */
-  while(!ngx_queue_empty(&server->accepted_fds)) {
+  while(!ngx_queue_empty(&tcp->accepted_fds)) {
     tcp->connection_cb((uv_stream_t*)tcp, 0);
   }
 }
