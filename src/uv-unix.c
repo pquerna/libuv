@@ -330,6 +330,9 @@ static void uv__handle_init(uv_handle_t* handle, uv_handle_type type) {
 
 
 int uv_tcp_init(uv_tcp_t* tcp) {
+#ifdef USE_THREADED_ACCEPT
+  int i;
+#endif
   uv__handle_init((uv_handle_t*)tcp, UV_TCP);
   uv_counters()->tcp_init++;
 
@@ -349,8 +352,8 @@ int uv_tcp_init(uv_tcp_t* tcp) {
   tcp->write_watcher.data = tcp;
 
 #ifdef USE_THREADED_ACCEPT
-  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-    uv__accept_worker_t *worker = tcp->accept_workers[i];
+  for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = &tcp->accept_workers[i];
     worker->baton = NULL;
   }
 #endif
@@ -549,8 +552,8 @@ static int tcp_accept(uv_tcp_t* server, uv_tcp_t* client) {
 
   streamClient = (uv_stream_t*)client;
 
-  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-    uv__accept_worker_t *worker = tcp->accept_workers[i];
+  for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = &server->accept_workers[i];
 
     if (ngx_queue_empty(&worker->fds)) {
       continue;
@@ -619,7 +622,7 @@ int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
 
 static void* accept_thread(void *baton) {
   uv__accept_worker_t *worker = baton;
-  uv_tcp_t* tcp = worker->tcp;
+  uv_tcp_t* tcp = worker->baton;
   int sockfd;
   fdq_t *q = NULL;
 
@@ -635,9 +638,9 @@ static void* accept_thread(void *baton) {
     if (sockfd != -1) {
       /* TODO: push to user */
       q->fd = sockfd;
-      pthread_mutex_lock(&tcp->accepted_fds_mutex);
-      ngx_queue_insert_tail(&tcp->accepted_fds, &q->queue);
-      pthread_mutex_unlock(&tcp->accepted_fds_mutex);
+      pthread_mutex_lock(&worker->fds_mutex);
+      ngx_queue_insert_tail(&worker->fds, &q->queue);
+      pthread_mutex_unlock(&worker->fds_mutex);
       q = NULL;
 
       uv_async_send(&tcp->accept_handle);
@@ -652,10 +655,11 @@ static void* accept_thread(void *baton) {
 }
 
 static void accept_queue_cb(uv_async_t* handle, int status) {
+  int i;
   uv_tcp_t* tcp = handle->data;
 
-  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-    uv__accept_worker_t *worker = tcp->accept_workers[i];
+  for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = &tcp->accept_workers[i];
     while(!ngx_queue_empty(&worker->fds)) {
       tcp->connection_cb((uv_stream_t*)tcp, 0);
     }
@@ -704,8 +708,8 @@ static int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 
     uv__nonblock(tcp->fd, 0);
 
-    for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-      uv__accept_worker_t *worker = tcp->accept_workers[i];
+    for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
+      uv__accept_worker_t *worker = &tcp->accept_workers[i];
       worker->baton = tcp;
       ngx_queue_init(&worker->fds);
       pthread_mutex_init(&worker->fds_mutex, NULL);
@@ -771,10 +775,10 @@ void uv__finish_close(uv_handle_t* handle) {
         int i;
         uv_tcp_t *tcp = (uv_tcp_t*) handle;
 
-        for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-          uv__accept_worker_t *worker = tcp->accept_workers[i];
+        for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
+          uv__accept_worker_t *worker = &tcp->accept_workers[i];
           if (worker->baton != NULL) {
-            pthread_join(worker->t);
+            pthread_join(worker->t, NULL);
           }
         }
       }

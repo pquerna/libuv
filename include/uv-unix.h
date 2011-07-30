@@ -32,7 +32,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-/* #define USE_THREADED_ACCEPT */
+#define USE_THREADED_ACCEPT
 
 #ifdef USE_THREADED_ACCEPT
 #include <pthread.h>
