@@ -66,11 +66,6 @@ extern char **environ;
 # endif
 
 
-#ifdef USE_THREADED_ACCEPT
-/* TODO: tune by hw.ncpu */
-#define THREADED_ACCEPT_COUNT (8)
-#endif
-
 static uv_err_t last_err;
 
 struct uv_ares_data_s {
@@ -353,11 +348,6 @@ int uv_tcp_init(uv_tcp_t* tcp) {
   ev_init(&tcp->write_watcher, uv__stream_io);
   tcp->write_watcher.data = tcp;
 
-#ifdef USE_THREADED_ACCEPT
-  ngx_queue_init(&tcp->accepted_fds);
-  pthread_mutex_init(&tcp->accepted_fds_mutex, NULL);
-#endif
-
   assert(ngx_queue_empty(&tcp->write_queue));
   assert(ngx_queue_empty(&tcp->write_completed_queue));
   assert(tcp->write_queue_size == 0);
@@ -544,6 +534,7 @@ static int tcp_accept(uv_tcp_t* server, uv_tcp_t* client) {
   fdq_t *fd = NULL;
   int saved_errno;
   int status;
+  int i;
   uv_stream_t* streamClient;
 
   saved_errno = errno;
@@ -551,38 +542,40 @@ static int tcp_accept(uv_tcp_t* server, uv_tcp_t* client) {
 
   streamClient = (uv_stream_t*)client;
 
-  pthread_mutex_lock(&server->accepted_fds_mutex);
+  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = tcp->accept_workers[i];
 
-  if (ngx_queue_empty(&server->accepted_fds)) {
-    pthread_mutex_unlock(&server->accepted_fds_mutex);
-    uv_err_new((uv_handle_t*)server, EAGAIN);
-    goto out;
+    if (ngx_queue_empty(&worker->fds)) {
+      continue;
+    }
+
+    pthread_mutex_lock(&worker->fds_mutex);
+
+    q = ngx_queue_head(&worker->fds);
+    if (!q) {
+      pthread_mutex_unlock(&worker->fds_mutex);
+      continue;
+    }
+
+    ngx_queue_remove(q);
+
+    pthread_mutex_unlock(&worker->fds_mutex);
+
+    fd = ngx_queue_data(q, fdq_t, queue);
+
+    if (uv__stream_open(streamClient, fd->fd)) {
+      uv__close(fd->fd);
+      break;
+    }
   }
 
-  q = ngx_queue_head(&server->accepted_fds);
-  if (!q) {
-    pthread_mutex_unlock(&server->accepted_fds_mutex);
-    uv_err_new((uv_handle_t*)server, EAGAIN);
-    goto out;
-  }
-
-  ngx_queue_remove(q);
-
-  pthread_mutex_unlock(&server->accepted_fds_mutex);
-
-  fd = ngx_queue_data(q, fdq_t, queue);
-
-  if (uv__stream_open(streamClient, fd->fd)) {
-    uv__close(fd->fd);
-    goto out;
-  }
-
-  status = 0;
-
-out:
   if (fd) {
+    status = 0;
     /* TODO: pool/reuse */
     free(fd);
+  }
+  else {
+    uv_err_new((uv_handle_t*)server, EAGAIN);
   }
 
   errno = saved_errno;
@@ -618,7 +611,8 @@ int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
 #ifdef USE_THREADED_ACCEPT
 
 static void* accept_thread(void *baton) {
-  uv_tcp_t* tcp = baton;
+  uv__accept_worker_t *worker = baton;
+  uv_tcp_t* tcp = worker->tcp;
   int sockfd;
   fdq_t *q = NULL;
 
@@ -653,9 +647,11 @@ static void* accept_thread(void *baton) {
 static void accept_queue_cb(uv_async_t* handle, int status) {
   uv_tcp_t* tcp = handle->data;
 
-  /* TODO: better queue impl (accepted connection ring per-accept thread?) */
-  while(!ngx_queue_empty(&tcp->accepted_fds)) {
-    tcp->connection_cb((uv_stream_t*)tcp, 0);
+  for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
+    uv__accept_worker_t *worker = tcp->accept_workers[i];
+    while(!ngx_queue_empty(&worker->fds)) {
+      tcp->connection_cb((uv_stream_t*)tcp, 0);
+    }
   }
 }
 
@@ -702,9 +698,11 @@ static int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
     uv__nonblock(tcp->fd, 0);
 
     for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
-      /* TODO: cleanup */
-      pthread_t t;
-      pthread_create(&t, NULL, accept_thread, tcp);
+      uv__accept_worker_t *worker = tcp->accept_workers[i];
+      worker->baton = tcp;
+      ngx_queue_init(&worker->fds);
+      pthread_mutex_init(&worker->fds_mutex, NULL);
+      pthread_create(&worker->t, NULL, accept_thread, worker);
     }
   }
 #else
@@ -760,6 +758,18 @@ void uv__finish_close(uv_handle_t* handle) {
         uv__close(stream->accepted_fd);
         stream->accepted_fd = -1;
       }
+
+#ifdef USE_THREADED_ACCEPT
+      if (handle->type == UV_TCP) {
+        int i;
+        uv_tcp_t *tcp = (uv_tcp_t*) handle;
+
+        for (i = 0; i < THREADED_ACCEPT_COUNT; i++) {
+          uv__accept_worker_t *worker = tcp->accept_workers[i];
+          pthread_join(worker->t);
+        }
+      }
+#endif
       break;
     }
 

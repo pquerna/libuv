@@ -84,11 +84,19 @@ typedef struct {
   int accepted_fd;
 
 
-#ifdef USE_THREADED_ACCEPT
 /* UV_TCP */
+#ifdef USE_THREADED_ACCEPT
+/* TODO: tune by hw.ncpu */
+#define UV__THREADED_ACCEPT_COUNT (8)
+typedef struct {
+  pthread_t t; \
+  pthread_mutex_t fds_mutex; \
+  ngx_queue_t fds; \
+  void *baton; \
+} uv__accept_worker_t;
+
 #define UV_TCP_PRIVATE_FIELDS \
-  pthread_mutex_t accepted_fds_mutex; \
-  ngx_queue_t accepted_fds; \
+  uv__accept_worker_t accept_workers[UV__THREADED_ACCEPT_COUNT]; \
   uv_async_t accept_handle;
 #else
 #define UV_TCP_PRIVATE_FIELDS
