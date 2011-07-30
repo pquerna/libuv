@@ -671,7 +671,7 @@ static void accept_queue_cb(uv_async_t* handle, int status) {
 
   for (i = 0; i < UV__THREADED_ACCEPT_COUNT; i++) {
     uv__accept_worker_t *worker = &tcp->accept_workers[i];
-    while(!ngx_queue_empty(&worker->fds)) {
+    if (!ngx_queue_empty(&worker->fds)) {
       tcp->connection_cb((uv_stream_t*)tcp, 0);
     }
   }
